@@ -1,0 +1,19 @@
+rtl/utils/coeff_accumulator.v
+rtl/utils/block_buffer.v
+rtl/utils/jpeg_block_serializer.v
+rtl/parser/jpeg_bitstream_reader.v
+rtl/parser/jpeg_header_parser.v
+rtl/entropy/jpeg_huffman_generator.v
+rtl/entropy/jpeg_huffman_decoder.v
+rtl/entropy/jpeg_entropy_decoder.v
+rtl/transform/jpeg_inverse_zigzag.v
+rtl/transform/jpeg_dequant.v
+rtl/transform/jpeg_transform_block.v
+rtl/transform/jpeg_idct_1d.v
+rtl/transform/jpeg_idct_2d.v
+rtl/color/jpeg_ycbcr_to_rgb.v
+rtl/top/jpeg_decoder_top.v
+tb/tb_jpeg_decoder_top.v
+
+iverilog -g2012 -o sim/system_test rtl/top/*.v rtl/parser/*.v rtl/entropy/*.v rtl/transform/*.v rtl/color/*.v rtl/utils/*.v tb/tb_jpeg_decoder_top.v
+vvp sim\system_test
