@@ -5,38 +5,28 @@ module jpeg_dequant
     parameter WIDTH_OUT = 32
 )
 (
-    // Input: Dữ liệu ảnh đã sắp xếp Row-Major (từ Inverse Zigzag)
     input  wire signed [WIDTH_IN*64-1:0]  matrix_in_flat,
-    // Input: Bảng lượng tử Row-Major (từ RAM/Register bên ngoài)
     input  wire        [WIDTH_Q*64-1:0]   quant_flat,    
-    // Output: Kết quả nhân
     output wire signed [WIDTH_OUT*64-1:0] dct_out_flat
 );
-
 
     genvar i;
     generate
         for (i = 0; i < 64; i = i + 1) begin : MULT_LOOP
-            // Khai báo dây cục bộ để code dễ đọc hơn
             wire signed [WIDTH_IN-1:0]  val;
-            wire signed [WIDTH_Q-1:0]   q_val;
+            // Ép kiểu Q thành signed với độ rộng lớn hơn 1 bit để tránh mất bit dấu
+            wire signed [WIDTH_Q:0]     q_val_expanded; 
             wire signed [WIDTH_OUT-1:0] mult_res;
 
+            assign val = matrix_in_flat[i*WIDTH_IN +: WIDTH_IN];
+            
+            // Q luôn dương, ta thêm 0 vào MSB và coi nó là số signed
+            assign q_val_expanded = $signed({1'b0, quant_flat[i*WIDTH_Q +: WIDTH_Q]});
 
-            // Cắt bit (Slicing)
-            assign val   = matrix_in_flat[(i+1)*WIDTH_IN-1 : i*WIDTH_IN];
-            // Q-table thường không âm, nhưng ta ép kiểu signed để phép nhân an toàn
-            assign q_val = $signed({1'b0, quant_flat[(i+1)*WIDTH_Q-1 : i*WIDTH_Q]}); // Zero-extend nếu cần
+            // Phép nhân signed: 16-bit * 17-bit = 33-bit (cắt lấy WIDTH_OUT)
+            assign mult_res = val * q_val_expanded;
 
-
-            // Nhân: Result = Val * Q
-            assign mult_res = val * q_val;
-
-
-            // Gán vào output
-            assign dct_out_flat[(i+1)*WIDTH_OUT-1 : i*WIDTH_OUT] = mult_res;
+            assign dct_out_flat[i*WIDTH_OUT +: WIDTH_OUT] = mult_res;
         end
     endgenerate
-
-
 endmodule

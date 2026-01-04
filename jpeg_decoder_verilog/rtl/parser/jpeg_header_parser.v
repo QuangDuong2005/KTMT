@@ -1,385 +1,304 @@
-// GD1: Tìm kiếm: FSM liên tục quét luồng byte đầu vào (S_IDLE, S_FIND_FF) tìm marker 0xFF
-// GD2: Phân loại: Khi tìm thấy 0xFF, kiểm tra byte tiếp theo (S_GOT_FF):
-// - Nếu là 0x00: bỏ qua -> tiếp tục tìm 0xFF
-// - Ngược lại, là các marker chuẩn như D8, C0.... -> lưu marker đó vào cur_marker
-// GD3: Đọc độ dài: Hầu hết các marker trừ SOI và SOS đều có 2 byte sau đó để biết segment này dài bao nhiêu. (S_READ_LEN_H, S_READ_LEN_L)
-// GD4: Xử lý dữ liệu: Tùy vào loại marker, FSM nhảy vào trạng thái tương ứng
-// - Marker SOF0: -> trạng thái S_READ_SOF0: trích xuất chiều dài, chiều rộng của ảnh
-// - Marker DQT: -> trạng thái S_READ_DQT: đọc bảng lượng tử (phân loại 8 bit và 16 bit) và lưu trữ vào bộ nhớ qtable_mem
-// - Marker DHT: -> S_READ_DHT: Đọc bảng Huffman (số lượng mã và các ký hiệu), lưu vào bộ nhớ dht_sym_mem.
-// - Marker lạ: S_SKIP_SEG: Nếu gặp marker lạ (APPn) hoặc header của SOS, nó đếm lùi bytes_left để bỏ qua.
-// GD5: Bàn giao (Handoff): Khi xử lý xong header của SOS (S_DONE_HDR), module bật tín hiệu start_scan và chuyển sang chế độ S_PASS_THROUGH
-// đẩy toàn bộ dữ liệu ảnh nén trực tiếp cho module Entropy Decoder.
 module jpeg_header_parser (
-input  wire        clk,
-input  wire        rst_n,
-// --- Giao diện đầu vào (Nhận byte từ Testbench/RAM) ---
-input  wire [7:0]  byte_in,          // Dữ liệu vào 8-bit
-input  wire        byte_valid,       // Báo hiệu dữ liệu hợp lệ
-output reg         parser_ready,     // =1: Sẵn sàng nhận (Handshake)
+    input wire clk,
+    input wire rst_n,
+    
+    // Luồng byte đầu vào
+    input wire [7:0] byte_in,
+    input wire byte_valid,
+    output reg parser_ready,
 
-// --- Thông tin ảnh đầu ra ---
-output reg [15:0]  img_height,       // Chiều cao ảnh
-output reg [15:0]  img_width,        // Chiều rộng ảnh
+    // Thông tin ảnh
+    output reg [15:0] img_height,
+    output reg [15:0] img_width,
+    output reg [3:0]  num_components,
+    
+    // Tín hiệu điều khiển
+    output reg dhttable_loaded,
+    output reg start_scan, // = 1 khi gặp SOS (FF DA)
+    
+    // Output Huffman Tables
+    output reg [7:0] dht_len_out [0:15],
+    output reg [7:0] dht_val_out [0:161],
 
-// --- Tín hiệu báo nạp bảng (Tables) ---
-output reg         qtable_loaded,    // Xung báo: Đã nạp xong 1 bảng Lượng tử
-output reg  [1:0]  qtable_id_loaded, // ID của bảng vừa nạp (0..3)
-
-output reg         dhttable_loaded,  // Xung báo: Đã nạp xong 1 bảng Huffman
-output reg         dht_table_class,  // Loại bảng (0=DC, 1=AC)
-output reg  [3:0]  dht_table_id,     // ID bảng (0..3)
-output reg  [8:0]  dht_sym_count,    // Số lượng symbol trong bảng này
-
-// --- Giao diện bàn giao (Pass-through) ---
-output reg         start_scan,       // Xung báo: Bắt đầu phần dữ liệu nén (Scan)
-output reg [7:0]   scan_byte_out,    // Dữ liệu ảnh nén chuyển tiếp
-output reg         scan_byte_valid   // Báo hiệu dữ liệu chuyển tiếp hợp lệ
+    // --- OUTPUT MỚI: Bảng lượng tử phẳng (Fix lỗi Crash Iverilog) ---
+    output wire [511:0] q_quant_table_flat
 );
 
-// =========================================================================
-// 1. ĐỊNH NGHĨA HẰNG SỐ MARKER
-// =========================================================================
-localparam SOI  = 8'hD8; // Khởi đầu ảnh
-localparam SOF0 = 8'hC0; // Thông số khung hình (Baseline)
-localparam DQT  = 8'hDB; // Bảng Lượng tử
-localparam DHT  = 8'hC4; // Bảng Huffman
-localparam SOS  = 8'hDA; // Bắt đầu quét (Start Scan)
+    // ==================================================================
+    // 1. ĐỊNH NGHĨA TRẠNG THÁI
+    // ==================================================================
+    localparam ST_IDLE          = 0;
+    localparam ST_MARKER_FF     = 1; // Tìm byte FF
+    localparam ST_MARKER_ID     = 2; // Đọc byte định danh (D8, C0, C4...)
+    localparam ST_LENGTH_HI     = 3; // Đọc độ dài marker (High byte)
+    localparam ST_LENGTH_LO     = 4; // Đọc độ dài marker (Low byte)
+    localparam ST_SKIP_DATA     = 5; // Bỏ qua dữ liệu không quan trọng
+    
+    // Trạng thái xử lý DQT (Quantization Table)
+    localparam ST_DQT_INFO      = 6;
+    localparam ST_DQT_READ      = 7;
+    
+    // Trạng thái xử lý SOF0 (Start of Frame)
+    localparam ST_SOF_PREC      = 8;
+    localparam ST_SOF_H_HI      = 9;
+    localparam ST_SOF_H_LO      = 10;
+    localparam ST_SOF_W_HI      = 11;
+    localparam ST_SOF_W_LO      = 12;
+    localparam ST_SOF_COMP      = 13;
+    localparam ST_SOF_SKIP      = 14;
 
-// =========================================================================
-// 2. ĐỊNH NGHĨA TRẠNG THÁI FSM
-// =========================================================================
-localparam S_IDLE         = 5'd0;  // Chờ khởi động
-localparam S_FIND_FF      = 5'd1;  // Tìm byte 0xFF
-localparam S_GOT_FF       = 5'd2;  // Đã thấy 0xFF, kiểm tra byte sau nó
-localparam S_READ_LEN_H   = 5'd3;  // Đọc byte cao độ dài
-localparam S_READ_LEN_L   = 5'd4;  // Đọc byte thấp độ dài
-localparam S_SEG_PROCESS  = 5'd5;  // Chọn nhánh xử lý
-localparam S_READ_SOF0    = 5'd6;  // Đọc SOF0
-localparam S_READ_DQT     = 5'd7;  // Đọc DQT
-localparam S_READ_DHT     = 5'd8;  // Đọc DHT
-localparam S_SKIP_SEG     = 5'd9;  // Bỏ qua segment lạ
-localparam S_DONE_HDR     = 5'd10; // Hoàn tất Header SOS
-localparam S_PASS_THROUGH = 5'd11; // Chế độ chuyển tiếp dữ liệu
-localparam S_READ_SOS = 5'd12;    // Đọc SOS 
-reg [4:0] state, next_state;
+    // Trạng thái xử lý DHT (Huffman Table)
+    localparam ST_DHT_INFO      = 15;
+    localparam ST_DHT_COUNTS    = 16;
+    localparam ST_DHT_SYMBOLS   = 17;
 
-// =========================================================================
-// 3. CÁC THANH GHI NỘI BỘ
-// =========================================================================
+    // Trạng thái SOS (Start of Scan)
+    localparam ST_SOS_SKIP      = 18;
+    localparam ST_DONE          = 19;
 
-// Quản lý độ dài Segment
-reg [15:0] seg_len;      // Độ dài toàn bộ segment
-reg [15:0] bytes_left;   // Số byte còn lại cần đọc
-reg [15:0] byte_cnt;     // Đếm số byte đã xử lý trong 1 mục
-reg [7:0]  cur_marker;   // Lưu loại Marker hiện tại
-reg        saw_ff;       // Cờ báo đã thấy 0xFF (dùng cho logic tìm kiếm)
+    reg [4:0] state;
+    reg [15:0] length_cnt; // Đếm số byte còn lại trong marker segment
+    reg [7:0]  marker_type;
 
-// Biến cho DQT (Bảng Lượng tử)
-reg [1:0]  cur_qtable_id;
-reg        cur_qtable_pq;
-reg [6:0]  q_coeff_index;       // Index 0..63
-reg        waiting_second_byte; // Cờ ghép 16-bit
-reg [7:0]  last_byte;           // Lưu tạm byte cao
+    // Bộ nhớ trong cho bảng lượng tử (4 bảng, mỗi bảng 64 byte)
+    reg [7:0] qtable_mem [0:3][0:63]; 
+    reg [1:0] current_dqt_id;
+    reg [5:0] dqt_idx;
 
-reg [15:0] qtable_mem [0:3][0:63]; //    Bộ nhớ lưu bảng lượng tử
-integer i, j;
+    // Bộ đếm cho DHT
+    reg [3:0] dht_len_idx;
+    reg [7:0] dht_val_cnt;
+    reg [7:0] total_syms;
 
-// Biến cho DHT (Bảng Huffman)
-reg [0:0]  cur_dht_tc;          // Table Class (DC/AC)
-reg [3:0]  cur_dht_th;          // Table ID
-reg [3:0]  dht_len_index;
-reg [7:0]  dht_len_byte [0:15]; // Mảng lưu số lượng mã (Li)
-reg [15:0] dht_symbols_to_read; // Tổng số symbol cần đọc
-reg [8:0]  dht_symbol_index;    // Index hiện tại
+    // ==================================================================
+    // 2. FSM (MÁY TRẠNG THÁI)
+    // ==================================================================
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            state <= ST_IDLE;
+            parser_ready <= 1;
+            img_height <= 0;
+            img_width <= 0;
+            num_components <= 0;
+            dhttable_loaded <= 0;
+            start_scan <= 0;
+            length_cnt <= 0;
+            dqt_idx <= 0;
+            current_dqt_id <= 0;
+        end else begin
+            // Chỉ xử lý khi có byte valid và chưa bắt đầu quét ảnh (start_scan)
+            if (byte_valid && !start_scan) begin
+                case (state)
+                    // --------------------------------------------------
+                    // TÌM MARKER
+                    // --------------------------------------------------
+                    ST_IDLE: begin
+                        if (byte_in == 8'hFF) state <= ST_MARKER_ID;
+                    end
 
-reg [7:0]  dht_sym_mem [0:31][0:255]; // Bộ nhớ lưu Symbol
-reg [8:0]  dht_sym_cnt [0:1][0:3];   // Lưu tổng số lượng symbol
-
-// =========================================================================
-// 4. MẠCH TUẦN TỰ (SEQUENTIAL LOGIC)
-// =========================================================================
-always @(posedge clk or negedge rst_n) begin
-    if (!rst_n) begin
-        // --- RESET TOÀN BỘ ---
-        state <= S_IDLE;
-        parser_ready <= 1'b1;
-        saw_ff <= 1'b0;
-        seg_len <= 0; bytes_left <= 0; byte_cnt <= 0; cur_marker <= 0;
-        
-        // Output Reset
-        img_height <= 0; img_width <= 0;
-        qtable_loaded <= 0; qtable_id_loaded <= 0;
-        dhttable_loaded <= 0; dht_table_class <= 0; dht_table_id <= 0; dht_sym_count <= 0;
-        start_scan <= 0; scan_byte_out <= 0; scan_byte_valid <= 0;
-
-        // Xóa bộ nhớ (Optional)
-        for (i=0; i<4; i=i+1) for (j=0; j<64; j=j+1) qtable_mem[i][j] <= 0;
-        for (i=0; i<2; i=i+1) for (j=0; j<4; j=j+1) dht_sym_cnt[i][j] <= 0;
-
-    end else begin
-        // Tự động tắt xung báo hiệu sau 1 chu kỳ
-        qtable_loaded <= 1'b0;
-        dhttable_loaded <= 1'b0;
-        start_scan <= 1'b0;
-        scan_byte_valid <= 1'b0;
-
-        // Cập nhật trạng thái kế tiếp
-        state <= next_state;
-
-        case (state)
-            S_IDLE: begin
-                saw_ff <= 1'b0; 
-                parser_ready <= 1'b1;
-            end
-
-            S_FIND_FF: begin
-                if (byte_valid && byte_in == 8'hFF) saw_ff <= 1'b1;
-            end
-
-            S_GOT_FF: begin
-                if (byte_valid) begin
-                    if (byte_in == 8'h00) saw_ff <= 1'b0; // Byte stuffing -> Bỏ qua
-                    else cur_marker <= byte_in;           // Marker xịn -> Lưu lại
-                end
-            end
-
-            S_READ_LEN_H: begin
-                if (byte_valid) seg_len[15:8] <= byte_in;
-            end
-
-            S_READ_LEN_L: begin
-                if (byte_valid) begin
-                    seg_len[7:0] <= byte_in;
-                    // Tính số byte dữ liệu còn lại (Trừ 2 byte length)
-                    bytes_left <= ({seg_len[15:8], byte_in}) - 16'd2;
-                    byte_cnt <= 0; // Reset bộ đếm
-                end
-            end
-
-            // --- XỬ LÝ SOF0 (Kích thước ảnh) ---
-            S_READ_SOF0: begin
-                if (byte_valid) begin
-                    if (byte_cnt == 1) img_height[15:8] <= byte_in;
-                    else if (byte_cnt == 2) img_height[7:0]  <= byte_in;
-                    else if (byte_cnt == 3) img_width[15:8]  <= byte_in;
-                    else if (byte_cnt == 4) img_width[7:0]   <= byte_in;
-                    
-                    byte_cnt <= byte_cnt + 1;
-                    if (bytes_left > 0) bytes_left <= bytes_left - 1;
-                end
-            end
-
-            // --- XỬ LÝ DQT (Bảng Lượng tử) ---
-            // Marker: 2 byte 0xFF 0xDB
-            // 2 byte: do dai segment 
-            // 1 byte: DQT info: 
-            //          4 bit cao (Pq): do chinh xac 
-            //          4 bit thap (Tq): id cua bang
-            // QT data
-            S_READ_DQT: begin
-                if (byte_valid) begin
-                    if (byte_cnt == 0) begin
-                        // Byte đầu tiên: Thông tin bảng
-                        cur_qtable_pq <= byte_in[7];
-                        cur_qtable_id <= byte_in[3:0];
-                        q_coeff_index <= 0;
-                        waiting_second_byte <= 0;
-                        
-                        byte_cnt <= byte_cnt + 1;
-                        if (bytes_left > 0) bytes_left <= bytes_left - 1;
-                    end else begin
-                        // Đọc 64 hệ số
-                        if (cur_qtable_pq == 0) begin 
-                            // Chế độ 8-bit
-                            qtable_mem[cur_qtable_id][q_coeff_index] <= {8'd0, byte_in};
-                            q_coeff_index <= q_coeff_index + 1;
-                            
-                            byte_cnt <= byte_cnt + 1;
-                            if (bytes_left > 0) bytes_left <= bytes_left - 1;
-
-                            if (q_coeff_index == 63) begin
-                                qtable_loaded <= 1'b1;
-                                qtable_id_loaded <= cur_qtable_id;
-                                byte_cnt <= 0; // Reset đón bảng tiếp theo
-                            end
-                        end else begin 
-                            // Chế độ 16-bit
-                            if (!waiting_second_byte) begin
-                                last_byte <= byte_in;
-                                waiting_second_byte <= 1;
-                                byte_cnt <= byte_cnt + 1;
-                                if (bytes_left > 0) bytes_left <= bytes_left - 1;
-                            end else begin
-                                qtable_mem[cur_qtable_id][q_coeff_index] <= {last_byte, byte_in};
-                                waiting_second_byte <= 0;
-                                q_coeff_index <= q_coeff_index + 1;
-                                
-                                byte_cnt <= byte_cnt + 1;
-                                if (bytes_left > 0) bytes_left <= bytes_left - 1;
-
-                                if (q_coeff_index == 63) begin
-                                    qtable_loaded <= 1'b1;
-                                    qtable_id_loaded <= cur_qtable_id;
-                                    byte_cnt <= 0;
-                                end
-                            end
+                    ST_MARKER_FF: begin // Trạng thái đệm nếu gặp nhiều FF liên tiếp
+                        if (byte_in != 8'hFF) begin
+                            // Byte này là ID marker
+                            // Logic xử lý nhảy ở case dưới, ở đây chuyển tiếp
+                            // (Code tối ưu gộp vào ST_MARKER_ID)
                         end
                     end
-                end
-            end
 
-            // --- XỬ LÝ DHT (Bảng Huffman) ---
-            S_READ_DHT: begin
-                if (byte_valid) begin
-                    if (byte_cnt == 0) begin
-                        // Thông tin bảng
-                        cur_dht_tc <= byte_in[4];
-                        cur_dht_th <= byte_in[3:0];
-                        dht_len_index <= 0;
-                        dht_symbols_to_read <= 0;
-                        dht_symbol_index <= 0;
-                        
-                        byte_cnt <= byte_cnt + 1;
-                        if (bytes_left > 0) bytes_left <= bytes_left - 1;
-                    end else if (byte_cnt <= 16) begin
-                        // Đọc Counts
-                        dht_len_byte[byte_cnt-1] <= byte_in;
-                        dht_symbols_to_read <= dht_symbols_to_read + byte_in;
-                        dht_len_index <= dht_len_index + 1;
-                        
-                        byte_cnt <= byte_cnt + 1;
-                        if (bytes_left > 0) bytes_left <= bytes_left - 1;
-                    end else begin
-                        // Đọc Symbols
-                        dht_sym_mem[{cur_dht_tc, cur_dht_th}][dht_symbol_index] <= byte_in;
-                        dht_symbol_index <= dht_symbol_index + 1;
-                        
-                        if (bytes_left > 0) bytes_left <= bytes_left - 1;
-
-                        // Kiểm tra xong bảng chưa
-                        if (dht_symbol_index + 1 >= dht_symbols_to_read) begin
-                            dhttable_loaded <= 1'b1;
-                            dht_table_class <= cur_dht_tc;
-                            dht_table_id <= cur_dht_th;
-                            dht_sym_count <= dht_symbols_to_read[8:0];
-                            
-                            byte_cnt <= 0; // Reset
-                            dht_symbols_to_read <= 0;
-                            dht_symbol_index <= 0;
+                    ST_MARKER_ID: begin
+                        if (byte_in == 8'hFF) begin
+                            // Vẫn là padding FF, đợi tiếp
+                            state <= ST_MARKER_ID;
+                        end else if (byte_in == 8'h00) begin
+                            // FF 00 không phải marker (byte stuffing), quay lại tìm FF
+                            state <= ST_IDLE;
                         end else begin
-                            byte_cnt <= byte_cnt + 1;
+                            // Đã tìm thấy Marker hợp lệ (FF XX)
+                            marker_type <= byte_in;
+                            case (byte_in)
+                                8'hD8: state <= ST_IDLE; // SOI (Start Image) -> Tiếp tục tìm
+                                8'hC0: state <= ST_LENGTH_HI; // SOF0 (Frame Info)
+                                8'hC4: state <= ST_LENGTH_HI; // DHT (Huffman)
+                                8'hDB: state <= ST_LENGTH_HI; // DQT (Quantization)
+                                8'hDA: state <= ST_LENGTH_HI; // SOS (Start Scan)
+                                8'hD9: state <= ST_IDLE; // EOI (End)
+                                default: state <= ST_LENGTH_HI; // Các marker khác (APPn, COM...) -> Đọc len để skip
+                            endcase
                         end
                     end
-                end
-            end
-            // --- XỬ LÝ SOS (Bỏ qua header SOS) ---
-            // Tìm đến case (state) trong khối always @(posedge clk)
-            S_READ_SOS: begin
-                if (byte_valid) begin
-                    byte_cnt <= byte_cnt + 1;
-                    if (bytes_left > 0) bytes_left <= bytes_left - 1;
-                end
-            end
-            // --- BỎ QUA SEGMENT ---
-            S_SKIP_SEG: begin
-                if (byte_valid) begin
-                    if (bytes_left > 0) bytes_left <= bytes_left - 1;
-                end
-            end
 
-           // --- CHUYỂN TIẾP DỮ LIỆU ---
-                S_PASS_THROUGH: begin
-                    parser_ready <= 1'b1;
+                    // --------------------------------------------------
+                    // ĐỌC ĐỘ DÀI (LENGTH)
+                    // --------------------------------------------------
+                    ST_LENGTH_HI: begin
+                        length_cnt[15:8] <= byte_in;
+                        state <= ST_LENGTH_LO;
+                    end
 
-                    // Chuyển tiếp byte trực tiếp
-                    if (byte_valid) begin
-                        scan_byte_out <= byte_in;
-                        scan_byte_valid <= 1'b1;
-                    end else begin
-                        scan_byte_valid <= 1'b0;
+                    ST_LENGTH_LO: begin
+                        length_cnt[7:0] <= byte_in;
+                        // Length bao gồm cả 2 byte độ dài, nên trừ 2 để ra số byte data còn lại
+                        // Tuy nhiên gán vào length_cnt ở chu kỳ sau sẽ là (Length - 2)
+                        // Ta xử lý trừ ở logic chuyển trạng thái tiếp theo
+                        
+                        case (marker_type)
+                            8'hC0: state <= ST_SOF_PREC;
+                            8'hDB: state <= ST_DQT_INFO;
+                            8'hC4: state <= ST_DHT_INFO;
+                            8'hDA: state <= ST_SOS_SKIP; // Đọc header SOS xong thì start
+                            default: state <= ST_SKIP_DATA;
+                        endcase
                     end
-                end
-                
-                // THÊM: S_DONE_HDR cũng phải chuyển tiếp nếu có byte dư
-                S_DONE_HDR: begin
-                    start_scan <= 1'b1;
-                    // Nếu byte_valid đang 1, nghĩa là đây là byte đầu tiên của scan
-                    // Cần đẩy nó ra scan_byte_out luôn!
-                    if (byte_valid) begin
-                         scan_byte_out <= byte_in;
-                         scan_byte_valid <= 1'b1;
+
+                    // --------------------------------------------------
+                    // SKIP DATA (APPn, COM...)
+                    // --------------------------------------------------
+                    ST_SKIP_DATA: begin
+                        // length_cnt ở đây là giá trị thực tế byte in
+                        // Cần logic trừ dần length_cnt
+                        // Lưu ý: length_cnt đang chứa giá trị full (vd 16). 
+                        // Ta đã đọc 2 byte length rồi.
+                        // Logic đơn giản hóa:
+                        if (length_cnt <= 3) state <= ST_IDLE; // 2 byte len + 1 byte đang đọc = 3
+                        else length_cnt <= length_cnt - 1;
                     end
-                    // next_state <= S_PASS_THROUGH;
-                end
-        endcase
+
+                    // --------------------------------------------------
+                    // XỬ LÝ DQT (BẢNG LƯỢNG TỬ)
+                    // --------------------------------------------------
+                    ST_DQT_INFO: begin
+                        // Byte này chứa: Precision (4 bit cao) và ID (4 bit thấp)
+                        current_dqt_id <= byte_in[1:0]; // Chỉ lấy ID 0-3
+                        dqt_idx <= 0;
+                        length_cnt <= length_cnt - 1;
+                        state <= ST_DQT_READ;
+                    end
+
+                    ST_DQT_READ: begin
+                        qtable_mem[current_dqt_id][dqt_idx] <= byte_in;
+                        length_cnt <= length_cnt - 1;
+                        if (dqt_idx == 63) begin
+                            // Đã đọc xong 64 byte của 1 bảng
+                            if (length_cnt <= 3) state <= ST_IDLE; // Hết data
+                            else state <= ST_DQT_INFO; // Có thể còn bảng tiếp theo trong cùng marker
+                        end else begin
+                            dqt_idx <= dqt_idx + 1;
+                        end
+                    end
+
+                    // --------------------------------------------------
+                    // XỬ LÝ SOF0 (START OF FRAME)
+                    // --------------------------------------------------
+                    ST_SOF_PREC: begin // Bỏ qua Precision (thường là 8)
+                        length_cnt <= length_cnt - 1;
+                        state <= ST_SOF_H_HI;
+                    end
+                    ST_SOF_H_HI: begin
+                        img_height[15:8] <= byte_in;
+                        length_cnt <= length_cnt - 1;
+                        state <= ST_SOF_H_LO;
+                    end
+                    ST_SOF_H_LO: begin
+                        img_height[7:0] <= byte_in;
+                        length_cnt <= length_cnt - 1;
+                        state <= ST_SOF_W_HI;
+                    end
+                    ST_SOF_W_HI: begin
+                        img_width[15:8] <= byte_in;
+                        length_cnt <= length_cnt - 1;
+                        state <= ST_SOF_W_LO;
+                    end
+                    ST_SOF_W_LO: begin
+                        img_width[7:0] <= byte_in;
+                        length_cnt <= length_cnt - 1;
+                        state <= ST_SOF_COMP;
+                    end
+                    ST_SOF_COMP: begin
+                        num_components <= byte_in[3:0];
+                        length_cnt <= length_cnt - 1;
+                        state <= ST_SOF_SKIP; // Skip các thông tin component chi tiết
+                    end
+                    ST_SOF_SKIP: begin
+                        if (length_cnt <= 3) state <= ST_IDLE;
+                        else length_cnt <= length_cnt - 1;
+                    end
+
+                    // --------------------------------------------------
+                    // XỬ LÝ DHT (HUFFMAN TABLE)
+                    // --------------------------------------------------
+                    ST_DHT_INFO: begin
+                        // Byte này là Class/ID (VD: 00 cho DC0, 10 cho AC0)
+                        // Để đơn giản cho decoder này, ta lưu thẳng vào mảng tuyến tính
+                        // (Thực tế cần decode Class/ID để map đúng)
+                        dht_len_idx <= 0;
+                        total_syms <= 0;
+                        length_cnt <= length_cnt - 1;
+                        state <= ST_DHT_COUNTS;
+                    end
+
+                    ST_DHT_COUNTS: begin
+                        // Đọc 16 byte đếm số lượng mã
+                        dht_len_out[dht_len_idx] <= byte_in;
+                        total_syms <= total_syms + byte_in;
+                        length_cnt <= length_cnt - 1;
+                        if (dht_len_idx == 15) begin
+                            dht_val_cnt <= 0;
+                            state <= ST_DHT_SYMBOLS;
+                        end else begin
+                            dht_len_idx <= dht_len_idx + 1;
+                        end
+                    end
+
+                    ST_DHT_SYMBOLS: begin
+                        // Đọc các symbol
+                        dht_val_out[dht_val_cnt] <= byte_in;
+                        dht_val_cnt <= dht_val_cnt + 1;
+                        length_cnt <= length_cnt - 1;
+                        // Kiểm tra xem đã đọc đủ symbol chưa hoặc hết marker chưa
+                        if (length_cnt <= 3) begin
+                            dhttable_loaded <= 1; // Báo hiệu đã có Huffman
+                            state <= ST_IDLE;
+                        end
+                    end
+
+                    // --------------------------------------------------
+                    // XỬ LÝ SOS (START OF SCAN)
+                    // --------------------------------------------------
+                    ST_SOS_SKIP: begin
+                        // SOS Header có vài byte (Scan select, Spectral selection...)
+                        // Ta skip hết cho đến khi hết length
+                        if (length_cnt <= 3) begin
+                            start_scan <= 1; // Kích hoạt giải mã Entropy
+                            parser_ready <= 0; // Parser ngừng nhận dữ liệu header
+                            state <= ST_DONE;
+                        end else begin
+                            length_cnt <= length_cnt - 1;
+                        end
+                    end
+
+                    ST_DONE: begin
+                        // Ở trạng thái này mãi mãi cho đến reset
+                        start_scan <= 1;
+                    end
+                    
+                    default: state <= ST_IDLE;
+                endcase
+            end
+        end
     end
-end
 
-// =========================================================================
-// 5. MẠCH TỔ HỢP (COMBINATIONAL LOGIC - CHUYỂN TRẠNG THÁI)
-// =========================================================================
-always @(*) begin
-    next_state = state; // Mặc định giữ nguyên
-
-    case (state)
-        S_IDLE:    next_state = S_FIND_FF;
-
-        S_FIND_FF: if (byte_valid && byte_in == 8'hFF) next_state = S_GOT_FF;
-
-        S_GOT_FF: begin
-            if (byte_valid) begin
-                if (byte_in == 8'hFF) next_state = S_GOT_FF;      // Vẫn là FF
-                else if (byte_in == 8'h00) next_state = S_FIND_FF; // Stuffing
-                else begin
-                    // Phân loại Marker
-                    if (byte_in == SOI) next_state = S_FIND_FF;
-                    else next_state = S_READ_LEN_H; // Mọi marker khác đều đọc length
-                end
-            end
+    // ==================================================================
+    // 3. LOGIC OUTPUT: BẢNG LƯỢNG TỬ (FLATTEN)
+    // ==================================================================
+    // Đây là phần sửa lỗi Assertion của Iverilog.
+    // Thay vì để Top module truy cập qtable_mem[][], ta đưa nó ra wire này.
+    
+    genvar k;
+    generate
+        for (k = 0; k < 64; k = k + 1) begin : flatten_q
+            // Xuất bảng lượng tử ID 0 (Luma - Độ sáng)
+            // Nếu bạn muốn hỗ trợ bảng Chroma, cần thêm output q_quant_table_1_flat
+            assign q_quant_table_flat[k*8 +: 8] = qtable_mem[0][k];
         end
+    endgenerate
 
-        S_READ_LEN_H: if (byte_valid) next_state = S_READ_LEN_L;
-
-        S_READ_LEN_L: begin
-            if (byte_valid) begin
-                // Điều hướng dựa trên Marker đã lưu
-                if (cur_marker == SOF0) next_state = S_READ_SOF0;
-                else if (cur_marker == DQT) next_state = S_READ_DQT;
-                else if (cur_marker == DHT) next_state = S_READ_DHT;
-                else if (cur_marker == SOS) next_state = S_READ_SOS; // Skip header SOS
-                else next_state = S_SKIP_SEG; // Skip APPn...
-            end
-        end
-
-        // Điều kiện thoát: Khi byte_valid và bytes_left == 1 (Byte cuối cùng)
-        S_READ_SOF0: if (byte_valid && bytes_left == 16'd1) next_state = S_FIND_FF;
-        S_READ_DQT:  if (byte_valid && bytes_left == 16'd1) next_state = S_FIND_FF;
-        S_READ_DHT:  if (byte_valid && bytes_left == 16'd1) next_state = S_FIND_FF;
-        // S_READ_LEN_L: begin
-        //     if (byte_valid) begin
-        //         if (cur_marker == SOS) next_state = S_READ_SOS; // Tạo trạng thái riêng
-        //         else if (cur_marker == SOF0) next_state = S_READ_SOF0;
-        //         else next_state = S_SKIP_SEG;
-        //     end
-        // end
-                            
-        S_READ_SOS: begin
-            // Chỉ tính toán xem trạng thái tiếp theo là gì
-            if (byte_valid && bytes_left <= 1) 
-                next_state = S_DONE_HDR; // Xong header SOS thì đi đến Done để Start Scan
-            else 
-                next_state = S_READ_SOS; // Chưa xong thì ở lại đọc tiếp
-        end
-        S_SKIP_SEG: begin
-            // Các segment khác (APPn, COM...) thì quay về tìm marker tiếp theo
-            if (byte_valid && bytes_left <= 1) next_state = S_FIND_FF;
-        end
-
-        S_DONE_HDR: next_state = S_PASS_THROUGH; // Kích hoạt tín hiệu start_scan
-        S_PASS_THROUGH: next_state = S_PASS_THROUGH; // Duy trì chế độ đẩy dữ liệu sang Entropy
-
-        default: next_state = S_FIND_FF;
-    endcase
-end
 endmodule

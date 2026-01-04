@@ -37,7 +37,7 @@ module jpeg_entropy_decoder (
     reg [5:0] idx;
 
     assign is_reading_bits = (state == S_READ_BITS);
-
+    // assign w_huff_enable = (state == ST_DECODING);
     // ================= COMBINATIONAL LOGIC & SAFETY =================
     
     // SAFETY FIX: Che chắn bit_in. Nếu bit_valid=0, ép về 0 để tránh lan truyền X

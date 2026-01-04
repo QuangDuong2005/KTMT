@@ -1,7 +1,7 @@
 # Script tạo file hex cho Verilog ($readmemh-safe)
 
-input_filename = "data/20260101.172947-pexels-pixabay-162140_resized (1).jpeg"
-output_filename = "data/test.hex"
+input_filename = r"C:\Users\PC\Downloads\jpeg\KTMT-main\KTMT-main\jpeg_decoder_verilog\data\20260104.124356-avatar-cute-3_resized.jpeg"
+output_filename = r"C:\Users\PC\Downloads\jpeg\KTMT-main\KTMT-main\jpeg_decoder_verilog\data\test.hex"
 
 try:
     with open(input_filename, "rb") as f:

@@ -1,61 +1,60 @@
 module jpeg_block_serializer (
-    input  wire        clk,
-    input  wire        rst_n,
-    input  wire        block_valid,       // Báo khối IDCT đã sẵn sàng
-    input  wire [511:0] block_in,         // 64 phần tử x 8 bit = 512 bit (đã trải phẳng)
+    input wire clk,
+    input wire rst_n,
+    
+    // Input Block (64 bytes)
+    input wire block_valid,
+    input wire [511:0] block_in,
+    output reg ready,
 
-
-    output reg         ready,             // Báo cho IDCT biết module đã sẵn sàng nhận khối mới
-    output reg         pixel_valid,
-    output reg signed [8:0] pixel_out     // Sign-extend lên 9 bit
+    // Output Pixels
+    output reg pixel_valid,
+    output reg [7:0] pixel_out,
+    output reg block_done // Pulse báo hiệu xong 1 block
 );
 
-
-    reg [5:0] idx; // Đếm từ 0 đến 63
-    reg reading;
-   
-    // Tạo mảng nội bộ để dễ truy xuất (tùy chọn, hoặc dùng trực tiếp block_in)
-    reg signed [7:0] internal_block [0:63];
-    integer i;
-
+    reg active;
+    reg [5:0] cnt;
+    reg [511:0] shift_reg;
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            idx         <= 0;
-            reading     <= 0;
+            ready <= 1;
+            active <= 0;
             pixel_valid <= 0;
-            pixel_out   <= 0;
-            ready       <= 1; // Sẵn sàng nhận sau khi reset
-        end
-        else begin
-            if (block_valid && ready) begin
-                // Chốt toàn bộ khối dữ liệu vào mảng nội bộ
-                for (i = 0; i < 64; i = i + 1) begin
-                    internal_block[i] <= block_in[i*8 +: 8];
-                end
-                reading <= 1;
-                ready   <= 0; // Đang bận xử lý, không nhận thêm khối mới
-                idx     <= 0;
-                pixel_valid <= 0;
-            end
-            else if (reading) begin
-                // Xuất từng pixel một
-                pixel_out   <= {internal_block[idx][7], internal_block[idx]}; // Sign-extend
+            pixel_out <= 0;
+            block_done <= 0;
+            cnt <= 0;
+            shift_reg <= 0;
+        end else begin
+            block_done <= 0; // Mặc định về 0
+
+            if (ready && block_valid) begin
+                ready <= 0;
+                active <= 1;
+                shift_reg <= block_in; // Load dữ liệu
+                cnt <= 0;
+                // Output pixel đầu tiên ngay lập tức
+                pixel_out <= block_in[7:0]; 
                 pixel_valid <= 1;
-
-
-                if (idx == 63) begin
-                    reading <= 0;
-                    ready   <= 1; // Xử lý xong, báo sẵn sàng nhận khối tiếp theo
-                    idx     <= 0;
+            end else if (active) begin
+                if (cnt == 63) begin
+                    active <= 0;
+                    ready <= 1;
+                    pixel_valid <= 0;
+                    block_done <= 1; // Pulse xong
                 end else begin
-                    idx <= idx + 1;
+                    cnt <= cnt + 1;
+                    // Dịch 8 bit
+                    shift_reg <= {8'h00, shift_reg[511:8]};
+                    // Output pixel tiếp theo (cần lấy từ shift_reg mới ở chu kỳ sau? 
+                    // Cách viết này lấy shift_reg[15:8] cho chu kỳ sau)
+                    pixel_out <= shift_reg[15:8]; 
+                    pixel_valid <= 1;
                 end
-            end
-            else begin
+            end else begin
                 pixel_valid <= 0;
             end
         end
     end
 endmodule
-
