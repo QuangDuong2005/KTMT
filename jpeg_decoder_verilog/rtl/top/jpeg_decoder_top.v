@@ -111,11 +111,11 @@ module jpeg_decoder_top (
     // ===========================================================================
     
     // Mux Parser/Bitstream Ready
-    assign parser_ready = r_scan_active ? w_bitstream_ready_internal : w_parser_ready_internal;
-
-    // Valid Demux
-    wire w_valid_to_parser    = byte_valid && !r_scan_active;
-    wire w_valid_to_bitstream = byte_valid && r_scan_active;
+    // Sử dụng w_scan_in_progress thay cho r_scan_active ở các dòng sau:
+    wire w_scan_in_progress = r_scan_active || w_start_scan;
+    assign parser_ready = w_scan_in_progress ? w_bitstream_ready_internal : w_parser_ready_internal;
+    wire w_valid_to_parser    = byte_valid && !w_scan_in_progress;
+    wire w_valid_to_bitstream = byte_valid && w_scan_in_progress;
 
     // FIX DEADLOCK 1: Bitstream Ready Logic
     // Bitstream được phép bắn bit nếu:
@@ -124,7 +124,8 @@ module jpeg_decoder_top (
     // 3. QUAN TRỌNG: Accumulator phải sẵn sàng! Nếu Accumulator đang đầy (chờ IDCT), 
     //    ta phải PAUSE toàn bộ chuỗi decode phía trước để tránh overwrite dữ liệu.
     
-    assign w_bit_ready = (w_huff_enable || w_entropy_reading) && (state == ST_DECODING);
+    // Sửa dòng này (nguồn: logic deadlock fix)
+    assign w_bit_ready = (w_huff_enable || w_entropy_reading) && (state != ST_HEADER);
 
     // ===========================================================================
     // 4. MODULE INSTANTIATION (Đã sửa lại kết nối)
@@ -156,7 +157,8 @@ module jpeg_decoder_top (
     // Lưu ý: Huffman Decoder của bạn cần latency thấp hoặc input buffer nếu không muốn bị miss symbol
     jpeg_huffman_decoder u_huff_dec (
         .clk(clk), .rst_n(rst_n),
-        .start(w_dht_loaded),
+        // .start(w_dht_loaded),
+        .start(w_start_scan),
         .enable(w_huff_enable),
         .bit_in(w_bit_stream),
         .bit_valid(w_bit_valid),

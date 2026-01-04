@@ -61,7 +61,7 @@ localparam S_READ_DHT     = 5'd8;  // Đọc DHT
 localparam S_SKIP_SEG     = 5'd9;  // Bỏ qua segment lạ
 localparam S_DONE_HDR     = 5'd10; // Hoàn tất Header SOS
 localparam S_PASS_THROUGH = 5'd11; // Chế độ chuyển tiếp dữ liệu
-
+localparam S_READ_SOS = 5'd12;    // Đọc SOS 
 reg [4:0] state, next_state;
 
 // =========================================================================
@@ -273,7 +273,14 @@ always @(posedge clk or negedge rst_n) begin
                     end
                 end
             end
-
+            // --- XỬ LÝ SOS (Bỏ qua header SOS) ---
+            // Tìm đến case (state) trong khối always @(posedge clk)
+            S_READ_SOS: begin
+                if (byte_valid) begin
+                    byte_cnt <= byte_cnt + 1;
+                    if (bytes_left > 0) bytes_left <= bytes_left - 1;
+                end
+            end
             // --- BỎ QUA SEGMENT ---
             S_SKIP_SEG: begin
                 if (byte_valid) begin
@@ -303,7 +310,7 @@ always @(posedge clk or negedge rst_n) begin
                          scan_byte_out <= byte_in;
                          scan_byte_valid <= 1'b1;
                     end
-                    next_state <= S_PASS_THROUGH;
+                    // next_state <= S_PASS_THROUGH;
                 end
         endcase
     end
@@ -340,7 +347,7 @@ always @(*) begin
                 if (cur_marker == SOF0) next_state = S_READ_SOF0;
                 else if (cur_marker == DQT) next_state = S_READ_DQT;
                 else if (cur_marker == DHT) next_state = S_READ_DHT;
-                else if (cur_marker == SOS) next_state = S_SKIP_SEG; // Skip header SOS
+                else if (cur_marker == SOS) next_state = S_READ_SOS; // Skip header SOS
                 else next_state = S_SKIP_SEG; // Skip APPn...
             end
         end
@@ -349,17 +356,28 @@ always @(*) begin
         S_READ_SOF0: if (byte_valid && bytes_left == 16'd1) next_state = S_FIND_FF;
         S_READ_DQT:  if (byte_valid && bytes_left == 16'd1) next_state = S_FIND_FF;
         S_READ_DHT:  if (byte_valid && bytes_left == 16'd1) next_state = S_FIND_FF;
-
+        // S_READ_LEN_L: begin
+        //     if (byte_valid) begin
+        //         if (cur_marker == SOS) next_state = S_READ_SOS; // Tạo trạng thái riêng
+        //         else if (cur_marker == SOF0) next_state = S_READ_SOF0;
+        //         else next_state = S_SKIP_SEG;
+        //     end
+        // end
+                            
+        S_READ_SOS: begin
+            // Chỉ tính toán xem trạng thái tiếp theo là gì
+            if (byte_valid && bytes_left <= 1) 
+                next_state = S_DONE_HDR; // Xong header SOS thì đi đến Done để Start Scan
+            else 
+                next_state = S_READ_SOS; // Chưa xong thì ở lại đọc tiếp
+        end
         S_SKIP_SEG: begin
-            if (byte_valid && bytes_left == 16'd1) begin
-                // Nếu vừa skip xong header SOS thì Bàn giao
-                if (cur_marker == SOS) next_state = S_DONE_HDR;
-                else next_state = S_FIND_FF;
-            end
+            // Các segment khác (APPn, COM...) thì quay về tìm marker tiếp theo
+            if (byte_valid && bytes_left <= 1) next_state = S_FIND_FF;
         end
 
-        S_DONE_HDR: next_state = S_PASS_THROUGH;
-        S_PASS_THROUGH: next_state = S_PASS_THROUGH;
+        S_DONE_HDR: next_state = S_PASS_THROUGH; // Kích hoạt tín hiệu start_scan
+        S_PASS_THROUGH: next_state = S_PASS_THROUGH; // Duy trì chế độ đẩy dữ liệu sang Entropy
 
         default: next_state = S_FIND_FF;
     endcase
