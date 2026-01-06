@@ -16,6 +16,12 @@ module jpeg_decoder_top (
     wire w_start_scan, w_parser_ready_int;
     wire [15:0] w_img_height, w_img_width;
     
+    // Component Info wires
+    wire [511:0] w_qtable_raw_0, w_qtable_raw_1;
+    wire [2:0] w_comp_h_samp [0:2];
+    wire [2:0] w_comp_v_samp [0:2];
+    wire [1:0] w_comp_quant_id [0:2];
+    
     // Huffman & Entropy Wires
     wire [11:0] w_coeff_val;
     wire [5:0]  w_coeff_idx;
@@ -45,11 +51,55 @@ module jpeg_decoder_top (
     wire [7:0] w_symbol_out;
 
     // ===========================================================================
-    // 2. BẢNG LƯỢNG TỬ MẶC ĐỊNH (HARDCODED) - NHƯ YÊU CẦU
+    // 2. LOGIC CHỌN VÀ MỞ RỘNG BẢNG LƯỢNG TỬ
     // ===========================================================================
-    // Gán tất cả 64 hệ số bằng 16. Đây là cách đơn giản nhất để tránh lỗi crash.
-    // 64 hệ số * 16 bit = 1024 bit
-    assign w_qtable_flat = {(64){16'd16}};
+    
+    // Bộ đếm đon giản để xác định block hiện tại thuộc component nào
+    // Giả sử 4:2:0: Y(0), Y(1), Y(2), Y(3), Cb(4), Cr(5)
+    // Giả sử 4:4:4: Y(0), Cb(1), Cr(2)
+    
+    reg [2:0] r_comp_idx;
+    reg [2:0] r_q_id_select;
+    
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) r_comp_idx <= 0;
+        else if (w_start_scan) r_comp_idx <= 0;
+        else if (w_raw_block_valid) begin
+            // Logic reset counter tùy mode.
+            // Check mode based on sampling factors of component 0
+            if (w_comp_h_samp[0] == 2 && w_comp_v_samp[0] == 2) begin // 4:2:0
+                 if (r_comp_idx == 5) r_comp_idx <= 0;
+                 else r_comp_idx <= r_comp_idx + 1;
+            end else begin // 4:4:4 (hoặc khác)
+                 if (r_comp_idx == 2) r_comp_idx <= 0;
+                 else r_comp_idx <= r_comp_idx + 1;
+            end
+        end
+    end
+    
+    always @(*) begin
+        // Map block index to Quant Table ID based on Component Info
+        // 4:2:0: Blk 0-3 uses Comp0(Y), Blk 4 uses Comp1(Cb), Blk 5 uses Comp2(Cr)
+        if (w_comp_h_samp[0] == 2 && w_comp_v_samp[0] == 2) begin
+            if (r_comp_idx < 4) r_q_id_select = w_comp_quant_id[0];
+            else if (r_comp_idx == 4) r_q_id_select = w_comp_quant_id[1];
+            else r_q_id_select = w_comp_quant_id[2];
+        end else begin
+            if (r_comp_idx == 0) r_q_id_select = w_comp_quant_id[0];
+            else if (r_comp_idx == 1) r_q_id_select = w_comp_quant_id[1];
+            else r_q_id_select = w_comp_quant_id[2];
+        end
+    end
+
+    wire [511:0] w_selected_q_raw = (r_q_id_select == 1) ? w_qtable_raw_1 : w_qtable_raw_0;
+    
+    // Mở rộng 8-bit -> 16-bit (Zero padding)
+    genvar gi;
+    generate
+        for (gi=0; gi<64; gi=gi+1) begin : pad_q
+             assign w_qtable_flat[gi*16 +: 16] = {8'h00, w_selected_q_raw[gi*8 +: 8]};
+        end
+    endgenerate
 
     // ===========================================================================
     // 3. MCU CONTROLLER (ĐƠN GIẢN - FIX LỖI 6399 PIXEL)
@@ -106,39 +156,25 @@ module jpeg_decoder_top (
     jpeg_idct_2d u_idct (.clk(clk), .matrix_in(r_idct_in), .matrix_out(w_idct_out));
 
     // Level Shift (+128) & Clamp (0-255) -> FIX MÀN HÌNH ĐEN
-    integer k;
-    integer v_clamp;
-    always @(*) begin
-        r_serializer_in_flat = 0;
-        for (k = 0; k < 64; k = k + 1) begin
-            v_clamp = w_idct_out[k] + 128; // Cộng 128 để phục hồi độ sáng
-            if (v_clamp < 0) r_serializer_in_flat[k*8 +: 8] = 8'h00;
-            else if (v_clamp > 255) r_serializer_in_flat[k*8 +: 8] = 8'hFF;
-            else r_serializer_in_flat[k*8 +: 8] = v_clamp[7:0];
-        end
-    end
-
-    // Block Serializer (Dùng bản chuẩn, KHÔNG dùng bản Indexed)
-    jpeg_block_serializer u_ser (
+    // --- THAY THẾ SERIALIZER & COLOR CONVERTER CŨ BẰNG MCU_MANAGER ---
+    
+    // Wire IDCT out (array)
+    // IDCT module outputs: wire signed [15:0] w_idct_out [0:63]
+    
+    // Cần 1 logic block_valid cho MCU Manager
+    // IDCT là combinational, nên block_valid của IDCT chính là w_raw_block_valid (từ Accum)
+    
+    mcu_manager u_mcu (
         .clk(clk), .rst_n(rst_n),
+        .block_in(w_idct_out),
         .block_valid(w_raw_block_valid), 
-        .block_in(r_serializer_in_flat), 
-        .ready(w_ser_ready),
-        .pixel_valid(w_pixel_valid_raw), 
-        .pixel_out(w_pixel_val_8bit),
-        .block_done(w_block_done_ser) 
-    );
-
-    // YCbCr to RGB (Chế độ Grayscale - Trắng đen)
-    jpeg_ycbcr_to_rgb #(.IMG_WIDTH(2048)) u_color (
-        .clk(clk), .rst_n(rst_n),
-        .valid_in(w_pixel_valid_final), 
-        .subsample_mode(2'b00),
-        .y_idct($signed({1'b0, w_pixel_val_8bit}) - 9'sd128), // Đưa về range -128..127
-        .cb_idct(9'sd0), // Gán cứng 0
-        .cr_idct(9'sd0), // Gán cứng 0
-        .r_out(r_out), .g_out(g_out), .b_out(b_out), 
-        .valid_out(rgb_valid)
+        
+        .comp_h_samp(w_comp_h_samp),
+        .comp_v_samp(w_comp_v_samp),
+        
+        .r_out(r_out), .g_out(g_out), .b_out(b_out),
+        .pixel_valid(rgb_valid),
+        .ready(w_ser_ready)
     );
 
     // ===========================================================================
@@ -150,8 +186,13 @@ module jpeg_decoder_top (
         .img_height(w_img_height), .img_width(w_img_width), .start_scan(w_start_scan),
         .parser_ready(w_parser_ready_int),
         .dhttable_loaded(w_dht_loaded),
-        .dht_len_out(w_dht_counts), .dht_val_out(w_dht_vals)
-        // LƯU Ý: Không kết nối cổng q_quant_table_flat ở đây nữa để tránh lỗi assertion
+        .dht_len_out(w_dht_counts), .dht_val_out(w_dht_vals),
+        
+        .q_quant_table_flat(w_qtable_raw_0),
+        .q_quant_table_1_flat(w_qtable_raw_1),
+        .comp_h_samp(w_comp_h_samp),
+        .comp_v_samp(w_comp_v_samp),
+        .comp_quant_id(w_comp_quant_id)
     );
 
     jpeg_bitstream_reader u_bitstream (
@@ -189,8 +230,8 @@ module jpeg_decoder_top (
         else case (state)
             ST_HEADER: if (w_start_scan) begin state <= ST_SCAN_IDLE; r_scan_active <= 1; end
             ST_SCAN_IDLE: state <= ST_DECODING;
-            ST_DECODING: if (w_raw_block_valid) state <= ST_PROCESS;
-            ST_PROCESS: if (w_ser_ready) state <= ST_DECODING; 
+            ST_DECODING: if (w_raw_block_valid) state <= ST_DECODING; // Keep decoding, no handshake needed (mcu_manager is fast enough)
+            ST_PROCESS: state <= ST_DECODING; // Unused now 
         endcase
     end
     

@@ -21,7 +21,13 @@ module jpeg_header_parser (
     output reg [7:0] dht_val_out [0:161],
 
     // --- OUTPUT MỚI: Bảng lượng tử phẳng (Fix lỗi Crash Iverilog) ---
-    output wire [511:0] q_quant_table_flat
+    output wire [511:0] q_quant_table_flat,
+    output wire [511:0] q_quant_table_1_flat,
+
+    // Component Info
+    output reg [2:0] comp_h_samp [0:2],
+    output reg [2:0] comp_v_samp [0:2],
+    output reg [1:0] comp_quant_id [0:2]
 );
 
     // ==================================================================
@@ -45,6 +51,9 @@ module jpeg_header_parser (
     localparam ST_SOF_W_HI      = 11;
     localparam ST_SOF_W_LO      = 12;
     localparam ST_SOF_COMP      = 13;
+    localparam ST_SOF_C_ID      = 20;
+    localparam ST_SOF_C_SAMP    = 21;
+    localparam ST_SOF_C_QT      = 22;
     localparam ST_SOF_SKIP      = 14;
 
     // Trạng thái xử lý DHT (Huffman Table)
@@ -69,6 +78,9 @@ module jpeg_header_parser (
     reg [3:0] dht_len_idx;
     reg [7:0] dht_val_cnt;
     reg [7:0] total_syms;
+
+    reg [3:0] comp_cnt; // Đếm số component đã đọc
+    reg [1:0] current_comp_id;
 
     // ==================================================================
     // 2. FSM (MÁY TRẠNG THÁI)
@@ -214,8 +226,31 @@ module jpeg_header_parser (
                     end
                     ST_SOF_COMP: begin
                         num_components <= byte_in[3:0];
+                        comp_cnt <= 0;
                         length_cnt <= length_cnt - 1;
-                        state <= ST_SOF_SKIP; // Skip các thông tin component chi tiết
+                        if (byte_in > 0) state <= ST_SOF_C_ID;
+                        else state <= ST_SOF_SKIP;
+                    end
+                    ST_SOF_C_ID: begin
+                        // Byte_in = Comp ID (1=Y, 2=Cb, 3=Cr OR 0,1,2 thường là 1,2,3)
+                        // Ta map vào index 0,1,2 dựa vào comp_cnt
+                        // current_comp_id <= byte_in; // Có thể lưu lại nếu cần
+                        length_cnt <= length_cnt - 1;
+                        state <= ST_SOF_C_SAMP;
+                    end
+                    ST_SOF_C_SAMP: begin
+                        // H (high 4), V (low 4)
+                        comp_h_samp[comp_cnt] <= byte_in[7:4];
+                        comp_v_samp[comp_cnt] <= byte_in[3:0];
+                        length_cnt <= length_cnt - 1;
+                        state <= ST_SOF_C_QT;
+                    end
+                    ST_SOF_C_QT: begin
+                        comp_quant_id[comp_cnt] <= byte_in[1:0];
+                        length_cnt <= length_cnt - 1;
+                        comp_cnt <= comp_cnt + 1;
+                        if (comp_cnt + 1 < num_components) state <= ST_SOF_C_ID;
+                        else state <= ST_SOF_SKIP;
                     end
                     ST_SOF_SKIP: begin
                         if (length_cnt <= 3) state <= ST_IDLE;
@@ -296,8 +331,9 @@ module jpeg_header_parser (
     generate
         for (k = 0; k < 64; k = k + 1) begin : flatten_q
             // Xuất bảng lượng tử ID 0 (Luma - Độ sáng)
-            // Nếu bạn muốn hỗ trợ bảng Chroma, cần thêm output q_quant_table_1_flat
             assign q_quant_table_flat[k*8 +: 8] = qtable_mem[0][k];
+            // Xuất bảng lượng tử ID 1 (Chroma - Màu)
+            assign q_quant_table_1_flat[k*8 +: 8] = qtable_mem[1][k];
         end
     endgenerate
 
