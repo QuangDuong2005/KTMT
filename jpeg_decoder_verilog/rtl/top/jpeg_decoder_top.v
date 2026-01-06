@@ -18,6 +18,7 @@ module jpeg_decoder_top (
     
     // Component Info wires
     wire [511:0] w_qtable_raw_0, w_qtable_raw_1;
+    wire [511:0] w_qtable_raw_2, w_qtable_raw_3; // Thêm dây cho bảng 2, 3
     wire [2:0] w_comp_h_samp [0:2];
     wire [2:0] w_comp_v_samp [0:2];
     wire [1:0] w_comp_quant_id [0:2];
@@ -91,7 +92,18 @@ module jpeg_decoder_top (
         end
     end
 
-    wire [511:0] w_selected_q_raw = (r_q_id_select == 1) ? w_qtable_raw_1 : w_qtable_raw_0;
+    // Logic chọn bảng lượng tử dựa trên ID (r_q_id_select)
+    reg [511:0] r_selected_q_raw;
+    always @(*) begin
+        case (r_q_id_select)
+            2'd0: r_selected_q_raw = w_qtable_raw_0;
+            2'd1: r_selected_q_raw = w_qtable_raw_1;
+            2'd2: r_selected_q_raw = w_qtable_raw_2;
+            2'd3: r_selected_q_raw = w_qtable_raw_3;
+            default: r_selected_q_raw = w_qtable_raw_0;
+        endcase
+    end
+    wire [511:0] w_selected_q_raw = r_selected_q_raw;
     
     // Mở rộng 8-bit -> 16-bit (Zero padding)
     genvar gi;
@@ -190,6 +202,8 @@ module jpeg_decoder_top (
         
         .q_quant_table_flat(w_qtable_raw_0),
         .q_quant_table_1_flat(w_qtable_raw_1),
+        .q_quant_table_2_flat(w_qtable_raw_2), // Mới
+        .q_quant_table_3_flat(w_qtable_raw_3), // Mới
         .comp_h_samp(w_comp_h_samp),
         .comp_v_samp(w_comp_v_samp),
         .comp_quant_id(w_comp_quant_id)

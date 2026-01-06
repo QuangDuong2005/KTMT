@@ -23,6 +23,8 @@ module jpeg_header_parser (
     // --- OUTPUT MỚI: Bảng lượng tử phẳng (Fix lỗi Crash Iverilog) ---
     output wire [511:0] q_quant_table_flat,
     output wire [511:0] q_quant_table_1_flat,
+    output wire [511:0] q_quant_table_2_flat, // ID 2 (Mới)
+    output wire [511:0] q_quant_table_3_flat, // ID 3 (Mới)
 
     // Component Info
     output reg [2:0] comp_h_samp [0:2],
@@ -334,6 +336,9 @@ module jpeg_header_parser (
             assign q_quant_table_flat[k*8 +: 8] = qtable_mem[0][k];
             // Xuất bảng lượng tử ID 1 (Chroma - Màu)
             assign q_quant_table_1_flat[k*8 +: 8] = qtable_mem[1][k];
+            assign q_quant_table_2_flat[k*8 +: 8] = qtable_mem[2][k];
+            // Xuất bảng lượng tử ID 3 (Mới)
+            assign q_quant_table_3_flat[k*8 +: 8] = qtable_mem[3][k];
         end
     endgenerate
 
