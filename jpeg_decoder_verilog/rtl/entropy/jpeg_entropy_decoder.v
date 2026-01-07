@@ -76,7 +76,7 @@ module jpeg_entropy_decoder (
         (amp_bits_reg << 1) | safe_bit_in;
 
     // ====================================================
-    // 4. HÀM GIẢI MÃ VLI (CỰC KỲ QUAN TRỌNG)
+    // 4. HÀM GIẢI MÃ VLI
     // ====================================================
     // JPEG KHÔNG dùng bù 2 cho số âm
     // Quy tắc:
@@ -115,7 +115,7 @@ module jpeg_entropy_decoder (
     assign vli_decoded = func_decode_vli(current_amp_comb, size_reg);
 
     // ====================================================
-    // 5. FSM SEQUENTIAL LOGIC (TRÁI TIM MODULE)
+    // 5. FSM SEQUENTIAL LOGIC
     // ====================================================
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
@@ -285,3 +285,4 @@ module jpeg_entropy_decoder (
         end
     end
 endmodule
+
